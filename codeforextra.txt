@@ -1,0 +1,211 @@
+!pip install -U transformers accelerate bitsandbytes decord
+
+import numpy as np
+import torch
+import torchvision.transforms as T
+from decord import VideoReader, cpu
+from PIL import Image
+from torchvision.transforms.functional import InterpolationMode
+from transformers import AutoModel, AutoTokenizer
+import json
+from tqdm import tqdm
+import re
+
+# ============================================================
+# 1. Device and Token Setup
+# ============================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+HF_TOKEN = "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"  # Your Hugging Face token
+
+# ============================================================
+# 2. Load Model and Tokenizer
+# ============================================================
+
+path = 'OpenGVLab/InternVL2_5-2B'
+model = AutoModel.from_pretrained(
+    path,
+    torch_dtype=torch.bfloat16,
+    low_cpu_mem_usage=True,
+    use_flash_attn=True,
+    trust_remote_code=True
+).eval().to(device)
+
+tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True, use_fast=False)
+
+# ============================================================
+# 3. Load Validation Dataset
+# ============================================================
+
+val_annotations_file = "ShapesQA_valset/annotations.json"
+val_annotations = json.load(open(val_annotations_file))
+
+image_dir = "ShapesQA_valset"
+
+# ============================================================
+# 4. Image Preprocessing Functions (from official example)
+# ============================================================
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+def build_transform(input_size):
+    """Build image preprocessing transform."""
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+    return transform
+
+def load_image(image_file, input_size=448, max_num=12):
+    """Load and preprocess the image."""
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, image_size=input_size, use_thumbnail=True, max_num=max_num)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+    return pixel_values
+
+def dynamic_preprocess(image, min_num=1, max_num=12, image_size=448, use_thumbnail=False):
+    """Dynamically preprocess images by splitting into blocks."""
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1)
+        if i * j <= max_num and i * j >= min_num
+    )
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    target_aspect_ratio = find_closest_aspect_ratio(aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+    return processed_images
+
+def find_closest_aspect_ratio(aspect_ratio, target_ratios, width, height, image_size):
+    """Find the closest aspect ratio from the target list."""
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+    return best_ratio
+
+# ============================================================
+# 5. Evaluate Model on ShapesQA Validation Set
+# ============================================================
+
+def extract_keyword(response, question):
+    """Extract keywords (numbers, colors, shapes) from the model response."""
+    word_to_number = {
+        "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+        "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10"
+    }
+
+    if any(word in question.lower() for word in ["many", "count", "number"]):
+        numbers = re.findall(r'\d+', response)
+        if numbers:
+            return numbers[0]
+        for word, num in word_to_number.items():
+            if word in response.lower():
+                return num
+        return "0"
+
+    if any(word in question.lower() for word in ["color", "colour"]):
+        colors = ["red", "blue", "green", "yellow", "purple", "orange"]
+        match = re.search(r"object to the (right|left|above|below) of [\w\s]+ is ([\w]+)", response, re.IGNORECASE)
+        if match and match.group(2).lower() in colors:
+            return match.group(2).lower()
+        for color in colors:
+            if color in response.lower():
+                return color
+        return "unknown"
+
+    if "shape" in question.lower():
+        shapes = ["circle", "square", "triangle"]
+        match = re.search(r"object to the (right|left|above|below) of [\w\s]+ is ([\w]+)", response, re.IGNORECASE)
+        if match and match.group(2).lower() in shapes:
+            return match.group(2).lower()
+        for shape in shapes:
+            if shape in response.lower():
+                return shape
+        return "unknown"
+
+    return response
+
+correct = 0
+total = len(val_annotations)
+
+generation_config = dict(
+    max_new_tokens=30,
+    do_sample=False,
+    num_beams=1,
+    temperature=0.1
+)
+
+for ann in tqdm(val_annotations, desc="Evaluating on ShapesQA Validation Set"):
+    image_path = f"{image_dir}/{ann['image']}"
+    question = ann["question"]
+    ground_truth = str(ann["answer"])
+
+    pixel_values = load_image(image_path, max_num=12).to(torch.bfloat16).to(device)
+
+    if any(word in question.lower() for word in ["many", "count", "number"]):
+        input_question = f"Answer with a number only: <image>\n{question}"
+    elif any(word in question.lower() for word in ["color", "colour"]):
+        input_question = f"Answer with a color only: <image>\n{question}"
+    elif "shape" in question.lower():
+        input_question = f"Answer with a shape only: <image>\n{question}"
+    else:
+        input_question = f"Answer with one word: <image>\n{question}"
+
+    response = model.chat(tokenizer, pixel_values, input_question, generation_config)
+
+    if isinstance(response, (tuple, list, dict)):
+        response = response[0] if isinstance(response, (tuple, list)) else response.get("text", "")
+    response = str(response)
+
+    response_keyword = extract_keyword(response, question)
+
+    #print(f"Question: {question}")
+    #print(f"Response: {response} (Keyword: {response_keyword})")
+    #print(f"Ground Truth: {ground_truth}")
+
+    if response_keyword.lower() == ground_truth.lower():
+        correct += 1
+
+# ============================================================
+# 6. Calculate and Print Accuracy
+# ============================================================
+
+accuracy = correct / total * 100
+print(f"\nShapesQA Validation Accuracy: {accuracy:.2f}%")
